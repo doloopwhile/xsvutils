@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+import argparse
+import codecs
+import collections
+import csv
+import io
+import sys
+
+EXIT_INVALID_ARGUMENT = 2
+
+Dialect = collections.namedtuple("Dialect", "name default_encoding csv_dialect")
+
+dialects = [
+    Dialect("csv", "sjis", csv.excel),
+    Dialect("tsv", "sjis", csv.excel_tab),
+    Dialect("csv:excel", "sjis", csv.excel),
+    Dialect("tsv:excel", "sjis", csv.excel_tab),
+    Dialect("ltsv", "utf8", None),
+]
+
+
+def get_dialect(name):
+    for d in dialects:
+        if d.name == name:
+            return d
+    raise KeyError(name)
+
+
+class LtsvReaderForUnseekable:
+    def __init__(self, fp):
+        self.fp = fp
+        self.lines = fp
+
+    def rows(self):
+        for line in self.lines:
+            yield parse_ltsv_line(line)
+
+    def all_fieldnames(self):
+        fieldnames = []
+        for line in self.fp:
+            self.lines.append(line)
+            d = parse_ltsv_line(line)
+            for k in d.keys():
+                if k not in fieldnames:
+                    fieldnames.append(k)
+        return fieldnames
+
+
+class LtsvReader:
+    def __init__(self, fp):
+        self.fp = fp
+
+    def rows(self):
+        for line in self.fp:
+            yield parse_ltsv_line(line)
+
+    def all_fieldnames(self):
+        pos = self.fp.tell()
+        self.fp.seek(0, io.SEEK_SET)
+        fieldnames = []
+        for line in self.fp:
+            line = line.rstrip("\n")
+            d = parse_ltsv_line(line)
+            for k in d.keys():
+                if k in fieldnames:
+                    continue
+                fieldnames.append(k)
+        self.fp.seek(pos, io.SEEK_SET)
+        return fieldnames
+
+
+class CsvReader:
+    def __init__(self, dictreader):
+        self.dictreader = dictreader
+
+    @classmethod
+    def create(cls, fp):
+        return cls(csv.DictReader(fp))
+
+    def rows(self):
+        return self.dictreader
+
+    def all_fieldnames(self):
+        it = iter(self.dictreader)
+        try:
+            row = next(it)
+        except StopIteration:
+            return {}
+        self.dictreader = itertools.chain([row], self.dictreader)
+        return row.key()
+
+
+def create_readers(files, dialect, encoding):
+    if not files:
+        files = ["-"]
+
+    readers = []
+    for f in files:
+        if f == "-":
+            fp = codecs.getwriter(encoding)(sys.stdin.buffer)
+        else:
+            fp = open(f, "r", encoding=encoding)
+
+        if dialect.name == "ltsv":
+            if fp.seekable():
+                readers.append(LtsvReader(fp))
+            else:
+                readers.append(LtsvReaderForUnseekable(fp))
+        else:
+            readers.append(CsvReader.create(fp, dialect=dialect.csv_dialact))
+
+    return readers
+
+
+def reduce_dict(adict, keys):
+    return dict((k, v) for k, v in adict.items() if k in keys)
+
+
+def write_ltsv_rows(fp, rows):
+    for r in rows:
+        tokens = []
+        for k, v in r.items():
+            if v is None:
+                v = ""
+            k = k.replace("\t", r"\t")
+            v = v.replace("\t", r"\t")
+            tokens.append(k + ":" + v)
+        fp.write("\t".join(tokens))
+        fp.write("\n")
+
+
+def parse_ltsv_line(line):
+    line = line.rstrip("\n")
+    d = collections.OrderedDict()
+    for t in line.split("\t"):
+        items = t.split(":", 1)
+        if len(items) == 1:
+            k = items[0]
+            v = None
+        else:
+            k, v = items
+        k = k.replace(r"\t", "\t")
+        v = v.replace(r"\t", "\t")
+        d[k] = v
+    return d
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("-f", dest="input_format", required=True, help="Input file format")
+    p.add_argument("-t", dest="output_format", required=True, help="Output file format")
+    p.add_argument("--input-encoding", dest="input_encoding",
+        help="Input file encoding")
+    p.add_argument("--output-encoding", dest="output_encoding",
+        help="Output file encoding")
+    p.add_argument("--output", dest="output",
+        help="Output file")
+    p.add_argument("--fieldnames", dest="fieldnames",
+        help="Header field names")
+    p.add_argument("--no-header", dest="no_header",
+        help="Do not write header row for CSV and TSV")
+    p.add_argument("file", nargs="*", help="Output file")
+
+    args = p.parse_args()
+
+    try:
+        input_dialect = get_dialect(args.input_format)
+    except KeyError:
+        print("Unknown input format {0!r}".format(args.input_format))
+        exit(EXIT_INVALID_ARGUMENT)
+
+    try:
+        output_dialect = get_dialect(args.output_format)
+    except KeyError:
+        print("Unknown output format {0!r}".format(args.output_format))
+        exit(EXIT_INVALID_ARGUMENT)
+
+    if args.fieldnames is not None:
+        args.fieldnames = args.fieldnames.split(",")
+
+    if args.input_encoding is not None:
+        input_encoding = args.input_encoding
+    else:
+        input_encoding = input_dialect.default_encoding
+
+    if args.input_encoding is not None:
+        args.input_encoding = input_dialect.default_encoding
+
+    readers = create_readers(args.file, input_dialect, input_encoding)
+
+    if args.output_encoding is not None:
+        output_encoding = args.output_encoding
+    else:
+        output_encoding = output_dialect.default_encoding
+
+    if args.output is not None:
+        fp = open(args.output, "w", encoding=output_encoding)
+    else:
+        fp = codecs.getwriter(output_encoding)(sys.stdout.buffer)
+
+    if output_dialect == "ltsv":
+        rows = (row for reader in readers for r in reader.rows())
+        if args.fieldnames is not None:
+            rows = (reduce_dicts(r, args.fieldnames) for r in rows)
+        write_ltsv_rows(fp, rows)
+    else:
+        if args.fieldnames is not None:
+            fieldnames = args.fieldnames
+        else:
+            fieldnames = []
+            for reader in readers:
+                for f in reader.all_fieldnames():
+                    if f not in fieldnames:
+                        fieldnames.append(f)
+
+        writer = csv.DictWriter(fp, fieldnames)
+        if not args.no_header:
+            writer.writeheader()
+        for reader in readers:
+            for row in reader.rows():
+                writer.writerow(row)
+
+main()

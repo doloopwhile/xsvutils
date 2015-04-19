@@ -1,0 +1,2 @@
+#!/bin/sh
+xsvconvert -f tsv -t csv "$@"
